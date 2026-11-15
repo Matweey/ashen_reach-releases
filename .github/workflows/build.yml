@@ -1,0 +1,156 @@
+# Builds «Пепельный Предел» from the private repo whenever its main has moved, and publishes it here as a release:
+#   AshenReach.pck  the game, run by the launcher with --main-pack
+#   world.zip       the atlas (maps) and the chronicles (lore) of the world, docs/world of the game
+#   Launcher.zip    the launcher for new players: Launcher.exe (Godot, with the game's icon) and Launcher.pck
+# The release notes are the commits that came to main since the last release: the launcher shows them as «Что нового».
+# Needs the secret SOURCE_TOKEN: a GitHub token that can read kamisama-nah/ashen_reach (see README).
+name: build
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"     # every 15 minutes: has main moved?
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if main has not moved"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE: kamisama-nah/ashen_reach
+  GODOT: "4.7.2"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.c.outputs.sha }}
+      last: ${{ steps.c.outputs.last }}
+      build: ${{ steps.c.outputs.build }}
+    steps:
+      - id: c
+        env:
+          SRC_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ -z "$SRC_TOKEN" ]; then
+            echo "No SOURCE_TOKEN secret yet: nothing to build (see README)."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sha=$(GH_TOKEN="$SRC_TOKEN" gh api "repos/$SOURCE/commits/main" --jq .sha)
+          last=$( (gh release view -R "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null || true) | grep -o 'sha:[0-9a-f]*' | head -1 | cut -d: -f2 || true)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+          if [ "$sha" != "$last" ] || [ "$FORCE" = "true" ]; then echo "build=true" >> "$GITHUB_OUTPUT"; else echo "build=false" >> "$GITHUB_OUTPUT"; fi
+          echo "main $sha, last release $last"
+
+  game:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          fetch-depth: 0
+          lfs: false
+      # Git LFS: the models only download when they changed (the rest from the cache), to spare the LFS quota
+      - run: cd src && git lfs ls-files -l | cut -d' ' -f1 | sort > ../lfs-ids.txt
+      - uses: actions/cache@v4
+        with:
+          path: src/.git/lfs
+          key: lfs-${{ hashFiles('lfs-ids.txt') }}
+          restore-keys: lfs-
+      - run: cd src && git lfs pull
+      # Godot's import cache: only what changed is imported again
+      - uses: actions/cache@v4
+        with:
+          path: src/.godot
+          key: godot-${{ env.GODOT }}-${{ github.run_id }}
+          restore-keys: godot-${{ env.GODOT }}-
+      - name: Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/${GODOT}-stable/Godot_v${GODOT}-stable_linux.x86_64.zip"
+          unzip -q godot.zip && mv "Godot_v${GODOT}-stable_linux.x86_64" godot && chmod +x godot
+      - name: Import and export the game
+        run: |
+          mkdir -p out
+          ./godot --headless --path src --import || true
+          ./godot --headless --path src --export-pack "Windows" "$PWD/out/AshenReach.pck"
+          ls -la out
+      - name: Atlas and chronicles
+        run: cd src/docs/world && zip -qr "$GITHUB_WORKSPACE/out/world.zip" .
+      - name: Launcher pack
+        run: |
+          sh src/tools/build_launcher.sh "$PWD/godot" "$PWD/launcher"
+          cp src/art/ui/icon.ico launcher/
+      - name: What is new
+        env:
+          LAST: ${{ needs.check.outputs.last }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          if [ -n "$LAST" ] && git -C src cat-file -e "$LAST" 2>/dev/null; then
+            git -C src log --no-merges --pretty='- %s' "$LAST..$SHA" | head -60 > notes.md
+          else
+            git -C src log --no-merges --pretty='- %s' -15 "$SHA" > notes.md
+          fi
+          [ -s notes.md ] || echo "- Мелкие правки" > notes.md
+          printf '\n<!-- sha:%s -->\n' "$SHA" >> notes.md
+          mv notes.md out/
+          cat out/notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher
+          path: launcher
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game
+          path: out
+          retention-days: 1
+
+  publish:
+    needs: [check, game]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+      - name: Launcher.zip (Godot renamed Launcher.exe, with the game's icon)
+        shell: bash
+        run: |
+          curl -sSL -o g.zip "https://github.com/godotengine/godot-builds/releases/download/${GODOT}-stable/Godot_v${GODOT}-stable_win64.exe.zip"
+          unzip -q g.zip
+          mkdir -p pack/AshenReach
+          mv "Godot_v${GODOT}-stable_win64.exe" pack/AshenReach/Launcher.exe
+          cp launcher/Launcher.pck pack/AshenReach/
+          curl -sSL -o rcedit.exe "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
+          ./rcedit.exe pack/AshenReach/Launcher.exe --set-icon launcher/icon.ico || echo "no icon"
+          cd pack && 7z a -bd ../game/Launcher.zip AshenReach > /dev/null
+      - name: Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          tag="v$(date -u +%Y.%m.%d-%H%M)-${SHA:0:7}"
+          gh release create "$tag" game/AshenReach.pck game/world.zip game/Launcher.zip --title "Версия $(date -u +%d.%m.%Y), ${SHA:0:7}" --notes-file game/notes.md
+          # a commit keeps the scheduled builds alive (GitHub stops them in a repo idle for 60 days)
+          echo "$SHA" > last_sha.txt
+          git config user.name "ashen-reach-build"
+          git config user.email "actions@users.noreply.github.com"
+          git add last_sha.txt
+          git commit -m "Версия $tag"
+          git push
