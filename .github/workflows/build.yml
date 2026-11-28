@@ -2,6 +2,7 @@
 #   AshenReach.pck  the game, run by the launcher with --main-pack
 #   world.zip       the atlas (maps) and the chronicles (lore) of the world, docs/world of the game
 #   Launcher.zip    the launcher for new players: Launcher.exe (Godot, with the game's icon) and Launcher.pck
+#   Launcher.pck    the launcher alone: the launchers already out there download it and update themselves
 # The release notes are the commits that came to main since the last release: the launcher shows them as «Что нового».
 # Needs the secret SOURCE_TOKEN: a GitHub token that can read kamisama-nah/ashen_reach (see README).
 name: build
@@ -146,7 +147,7 @@ jobs:
           SHA: ${{ needs.check.outputs.sha }}
         run: |
           tag="v$(date -u +%Y.%m.%d-%H%M)-${SHA:0:7}"
-          gh release create "$tag" game/AshenReach.pck game/world.zip game/Launcher.zip --title "Версия $(date -u +%d.%m.%Y), ${SHA:0:7}" --notes-file game/notes.md
+          gh release create "$tag" game/AshenReach.pck game/world.zip game/Launcher.zip launcher/Launcher.pck --title "Версия $(date -u +%d.%m.%Y), ${SHA:0:7}" --notes-file game/notes.md
           # a commit keeps the scheduled builds alive (GitHub stops them in a repo idle for 60 days)
           echo "$SHA" > last_sha.txt
           git config user.name "ashen-reach-build"
